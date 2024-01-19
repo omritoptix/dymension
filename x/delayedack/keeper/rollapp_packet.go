@@ -5,6 +5,7 @@ import (
 
 	"github.com/cosmos/cosmos-sdk/store/prefix"
 	sdk "github.com/cosmos/cosmos-sdk/types"
+	transfertypes "github.com/cosmos/ibc-go/v6/modules/apps/transfer/types"
 	"github.com/dymensionxyz/dymension/x/delayedack/types"
 )
 
@@ -23,6 +24,54 @@ func (k Keeper) SetRollappPacket(ctx sdk.Context, rollappID string, rollappPacke
 		rollappPacket.ProofHeight,
 		*rollappPacket.Packet,
 	), b)
+}
+
+// GetRollappPacket retrieves a rollapp packet from the KVStore.
+func (k Keeper) GetRollappPacket(ctx sdk.Context, rollappPacketKey string) *types.RollappPacket {
+	store := prefix.NewStore(ctx.KVStore(k.storeKey), types.KeyPrefix(types.RollappPacketKeyPrefix))
+	b := store.Get([]byte(rollappPacketKey))
+	if b == nil {
+		return nil
+	}
+
+	var rollappPacket types.RollappPacket
+	k.cdc.MustUnmarshal(b, &rollappPacket)
+	return &rollappPacket
+}
+
+// UpdateRollappPacketRecipient updates the recipient of the underlying packet.
+// Only pending packets can be updated.
+func (k Keeper) UpdateRollappPacketRecipient(
+	ctx sdk.Context,
+	rollappPacketKey string,
+	newRecipient string,
+) error {
+	rollappPacket := k.GetRollappPacket(ctx, rollappPacketKey)
+	if rollappPacket.Status != types.RollappPacket_PENDING {
+		return types.ErrCanOnlyUpdatePendingPacket
+	}
+	var data transfertypes.FungibleTokenPacketData
+	if err := transfertypes.ModuleCdc.UnmarshalJSON(rollappPacket.Packet.GetData(), &data); err != nil {
+		return err
+	}
+	// Create a copy of the packet with the new recipient
+	newPacketData := transfertypes.NewFungibleTokenPacketData(
+		data.Denom,
+		data.Amount,
+		data.Sender,
+		newRecipient,
+		data.Memo,
+	)
+	// Marshall to binary and update the packet with this data
+	packetBytes := newPacketData.GetBytes()
+	packet := rollappPacket.Packet
+	packet.Data = packetBytes
+	// Update rollapp packet with the new updated packet and save in the store
+	rollappPacket.Packet = packet
+	b := k.cdc.MustMarshal(rollappPacket)
+	store := prefix.NewStore(ctx.KVStore(k.storeKey), types.KeyPrefix(types.RollappPacketKeyPrefix))
+	store.Set([]byte(rollappPacketKey), b)
+	return nil
 }
 
 // UpdateRollappPacketStatus deletes the current rollapp packet and creates a new one with and updated status under a new key.

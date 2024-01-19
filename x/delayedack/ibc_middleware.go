@@ -1,6 +1,10 @@
 package delayedack
 
 import (
+	"encoding/json"
+	"fmt"
+	"strconv"
+
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	capabilitytypes "github.com/cosmos/cosmos-sdk/x/capability/types"
 	transfertypes "github.com/cosmos/ibc-go/v6/modules/apps/transfer/types"
@@ -10,21 +14,30 @@ import (
 	"github.com/cosmos/ibc-go/v6/modules/core/exported"
 	keeper "github.com/dymensionxyz/dymension/x/delayedack/keeper"
 	"github.com/dymensionxyz/dymension/x/delayedack/types"
+	eibckeeper "github.com/dymensionxyz/dymension/x/eibc/keeper"
+	eibctypes "github.com/dymensionxyz/dymension/x/eibc/types"
+)
+
+const (
+	eibcMemoObjectName = "eibc"
+	eibcMemoFieldFee   = "fee"
 )
 
 var _ porttypes.Middleware = &IBCMiddleware{}
 
 // IBCMiddleware implements the ICS26 callbacks
 type IBCMiddleware struct {
-	app    porttypes.IBCModule
-	keeper keeper.Keeper
+	app        porttypes.IBCModule
+	keeper     keeper.Keeper
+	eibcKeeper eibckeeper.Keeper
 }
 
 // NewIBCMiddleware creates a new IBCMiddlware given the keeper and underlying application
-func NewIBCMiddleware(app porttypes.IBCModule, keeper keeper.Keeper) IBCMiddleware {
+func NewIBCMiddleware(app porttypes.IBCModule, keeper keeper.Keeper, eibcKeeper eibckeeper.Keeper) IBCMiddleware {
 	return IBCMiddleware{
-		app:    app,
-		keeper: keeper,
+		app:        app,
+		keeper:     keeper,
+		eibcKeeper: eibcKeeper,
 	}
 }
 
@@ -153,6 +166,35 @@ func (im IBCMiddleware) OnRecvPacket(
 		Type:        types.RollappPacket_ON_RECV,
 	}
 	im.keeper.SetRollappPacket(ctx, chainID, rollappPacket)
+
+	// Handle eibc demand order if exists
+	rollappPacketStoreKey := types.GetRollappPacketKey(chainID, rollappPacket.Status, rollappPacket.ProofHeight, *rollappPacket.Packet)
+	var eibcDemandOrder *eibctypes.DemandOrder
+	d := make(map[string]interface{})
+	err = json.Unmarshal([]byte(data.Memo), &d)
+	if err != nil {
+		logger.Error("Failed to unmarshal memo field", "err", err)
+	}
+	if d[eibcMemoObjectName] != nil {
+		if d[eibcMemoObjectName].(map[string]interface{})[eibcMemoFieldFee] == nil {
+			return channeltypes.NewErrorAcknowledgement(fmt.Errorf("Failed to parse eibc data, %s", "fee field is missing"))
+		}
+		fee := d[eibcMemoObjectName].(map[string]interface{})[eibcMemoFieldFee].(string)
+		amount, err := strconv.Atoi(data.Amount)
+		if err != nil {
+			return channeltypes.NewErrorAcknowledgement(fmt.Errorf("Failed to convert amount to integer, %s", err))
+		}
+		feeInt, err := strconv.Atoi(fee)
+		if err != nil {
+			return channeltypes.NewErrorAcknowledgement(fmt.Errorf("Failed to convert fee to integer, %s", err))
+		}
+		eibcDemandOrder = eibctypes.NewDemandOrder(string(rollappPacketStoreKey), strconv.Itoa(amount-feeInt), fee, data.Denom, data.Receiver)
+		if err := eibcDemandOrder.Validate(data.Amount); err != nil {
+			return channeltypes.NewErrorAcknowledgement(fmt.Errorf("Failed to validate eibc data, %s", err))
+		}
+		// Save the eibc order in the store
+		im.eibcKeeper.SetDemandOrder(ctx, eibcDemandOrder)
+	}
 
 	return nil
 }
