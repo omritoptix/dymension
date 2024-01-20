@@ -23,7 +23,8 @@ message RollappPacket {
       ON_RECV = 0;
       ON_ACK = 1;
       ON_TIMEOUT = 2;
-    }
+    } 
     Type type = 8;
+    
   
   }
