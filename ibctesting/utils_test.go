@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	"github.com/cosmos/ibc-go/v6/modules/apps/transfer/types"
+	transfertypes "github.com/cosmos/ibc-go/v6/modules/apps/transfer/types"
+	channeltypes "github.com/cosmos/ibc-go/v6/modules/core/04-channel/types"
 	ibctesting "github.com/cosmos/ibc-go/v6/testing"
 	app "github.com/dymensionxyz/dymension/app"
 	rollapptypes "github.com/dymensionxyz/dymension/x/rollapp/types"
@@ -30,6 +32,7 @@ func ConvertToApp(chain *ibctesting.TestChain) *app.App {
 	return app
 }
 
+// TODO: Change KeeperTestSuite to IBCUtilsTestSuite and wrap each test in a subsuite
 // KeeperTestSuite is a testing suite to test keeper functions.
 type KeeperTestSuite struct {
 	suite.Suite
@@ -66,21 +69,6 @@ func (suite *KeeperTestSuite) CreateRollapp() {
 	_, err := suite.hubChain.SendMsgs(msgCreateRollapp)
 	suite.Require().NoError(err) // message committed
 
-	rollappKeeper := ConvertToApp(suite.hubChain).RollappKeeper
-	ctx := suite.hubChain.GetContext()
-
-	stateInfoIdx := rollapptypes.StateInfoIndex{RollappId: suite.rollappChain.ChainID, Index: 1}
-	stateInfo := rollapptypes.StateInfo{
-		StateInfoIndex: stateInfoIdx,
-		StartHeight:    0,
-		NumBlocks:      uint64(ctx.BlockHeader().Height - 1),
-		Status:         rollapptypes.STATE_STATUS_FINALIZED,
-	}
-
-	// update the status of the stateInfo
-	rollappKeeper.SetStateInfo(ctx, stateInfo)
-	// uppdate the LatestStateInfoIndex of the rollapp
-	rollappKeeper.SetLatestFinalizedStateIndex(ctx, stateInfoIdx)
 }
 
 func (suite *KeeperTestSuite) CreateRollappWithMetadata(denom string) {
@@ -113,23 +101,35 @@ func (suite *KeeperTestSuite) CreateRollappWithMetadata(denom string) {
 	suite.Require().NoError(err) // message committed
 }
 
-func (suite *KeeperTestSuite) FinalizeRollapp() error {
+func (suite *KeeperTestSuite) UpdateRollappState(index uint64, startHeight uint64) {
 	rollappKeeper := ConvertToApp(suite.hubChain).RollappKeeper
 	ctx := suite.hubChain.GetContext()
 
-	stateInfoIdx := rollapptypes.StateInfoIndex{RollappId: suite.rollappChain.ChainID, Index: 2}
+	stateInfoIdx := rollapptypes.StateInfoIndex{RollappId: suite.rollappChain.ChainID, Index: index}
 	stateInfo := rollapptypes.StateInfo{
 		StateInfoIndex: stateInfoIdx,
-		StartHeight:    uint64(ctx.BlockHeader().Height),
-		NumBlocks:      10,
-		Status:         rollapptypes.STATE_STATUS_FINALIZED,
+		StartHeight:    startHeight,
+		NumBlocks:      1,
+		Status:         rollapptypes.STATE_STATUS_RECEIVED,
 	}
 
 	// update the status of the stateInfo
 	rollappKeeper.SetStateInfo(ctx, stateInfo)
+}
+
+func (suite *KeeperTestSuite) FinalizeRollappState(index uint64, endHeight uint64) error {
+	rollappKeeper := ConvertToApp(suite.hubChain).RollappKeeper
+	ctx := suite.hubChain.GetContext()
+
+	stateInfoIdx := rollapptypes.StateInfoIndex{RollappId: suite.rollappChain.ChainID, Index: index}
+	stateInfo, found := rollappKeeper.GetStateInfo(ctx, suite.rollappChain.ChainID, stateInfoIdx.Index)
+	suite.Require().True(found)
+	stateInfo.NumBlocks = endHeight - stateInfo.StartHeight + 1
+	stateInfo.Status = rollapptypes.STATE_STATUS_FINALIZED
+	// update the status of the stateInfo
+	rollappKeeper.SetStateInfo(ctx, stateInfo)
 	// update the LatestStateInfoIndex of the rollapp
 	rollappKeeper.SetLatestFinalizedStateIndex(ctx, stateInfoIdx)
-
 	err := rollappKeeper.GetHooks().AfterStateFinalized(
 		suite.hubChain.GetContext(),
 		suite.rollappChain.ChainID,
@@ -137,6 +137,31 @@ func (suite *KeeperTestSuite) FinalizeRollapp() error {
 	)
 	return err
 }
+
+// func (suite *KeeperTestSuite) FinalizeRollapp() error {
+// 	rollappKeeper := ConvertToApp(suite.hubChain).RollappKeeper
+// 	ctx := suite.hubChain.GetContext()
+
+// 	stateInfoIdx := rollapptypes.StateInfoIndex{RollappId: suite.rollappChain.ChainID, Index: 2}
+// 	stateInfo := rollapptypes.StateInfo{
+// 		StateInfoIndex: stateInfoIdx,
+// 		StartHeight:    uint64(ctx.BlockHeader().Height),
+// 		NumBlocks:      10,
+// 		Status:         rollapptypes.STATE_STATUS_FINALIZED,
+// 	}
+
+// 	// update the status of the stateInfo
+// 	rollappKeeper.SetStateInfo(ctx, stateInfo)
+// 	// update the LatestStateInfoIndex of the rollapp
+// 	rollappKeeper.SetLatestFinalizedStateIndex(ctx, stateInfoIdx)
+
+// 	err := rollappKeeper.GetHooks().AfterStateFinalized(
+// 		suite.hubChain.GetContext(),
+// 		suite.rollappChain.ChainID,
+// 		&stateInfo,
+// 	)
+// 	return err
+// }
 
 func (suite *KeeperTestSuite) NewTransferPath(chainA, chainB *ibctesting.TestChain) *ibctesting.Path {
 	path := ibctesting.NewPath(chainA, chainB)
@@ -147,4 +172,17 @@ func (suite *KeeperTestSuite) NewTransferPath(chainA, chainB *ibctesting.TestCha
 	path.EndpointB.ChannelConfig.Version = types.Version
 
 	return path
+}
+
+func (suite *KeeperTestSuite) GetRollappToHubIBCDenomFromPacket(packet channeltypes.Packet) string {
+	var data transfertypes.FungibleTokenPacketData
+	err := transfertypes.ModuleCdc.UnmarshalJSON(packet.GetData(), &data)
+	suite.Require().NoError(err)
+	// since SendPacket did not prefix the denomination, we must prefix denomination here
+	sourcePrefix := types.GetDenomPrefix(packet.GetDestPort(), packet.GetDestChannel())
+	// NOTE: sourcePrefix contains the trailing "/"
+	prefixedDenom := sourcePrefix + data.Denom
+	// construct the denomination trace from the full raw denomination
+	denomTrace := types.ParseDenomTrace(prefixedDenom)
+	return denomTrace.IBCDenom()
 }
